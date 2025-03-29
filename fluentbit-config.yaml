@@ -1,0 +1,107 @@
+apiVersion: v1
+data:
+  custom-parsers.conf: |-
+    [PARSER]
+        Name   json
+        Format json
+        
+    [PARSER]
+        Name cri
+        Format regex
+        Regex ^(?<time>[^ ]+) (?<stream>stdout|stderr) (?<logtag>[^ ]*) (?<message>.*)$
+        Time_Key    time
+        Time_Format %Y-%m-%dT%H:%M:%S.%L%z
+        Time_Keep   On
+
+    [PARSER]
+        Name                multiline_stdout
+        Format              regex
+        Regex               (?<eks_log_prefix>\d{4}-\d{1,2}-\d{1,2}T\d{2}:\d{2}:\d{2}\.\w* stdout F )(?<service_time>\d{4}-\d{1,2}-\d{1,2} \d{2}:\d{2}:\d{2}\.\w*)(?<log>[\s\S]*)
+        Time_Key            time
+        Time_Format         %Y-%m-%dT%H:%M:%S.%LZ
+  dynamic_index.lua: |-
+    function set_index(tag, timestamp, record)
+      local date = os.date("%Y.%m.%d", timestamp)
+      local agent_version = "v1"
+      if record["kubernetes"] ~= nil and record["kubernetes"]["container_name"] ~= nil then
+        local container_name = record["kubernetes"]["container_name"] or "unknown"
+        record["es_index"] = string.format("%s-%s-%s", container_name, agent_version, date)
+      else
+        record["es_index"] = string.format("default-%s-%s", agent_version, date)
+      end
+      return 1, timestamp, record
+    end
+  fluent-bit.conf: |-
+    [SERVICE]
+      Flush 5
+      Log_Level info
+      Daemon off
+      Parsers_File custom-parsers.conf
+      HTTP_Server On
+      HTTP_Listen 0.0.0.0
+      HTTP_Port 2020
+
+    [INPUT]
+      Name              tail
+      Tag               kube.*
+      Path              /var/log/containers/*.log
+      Multiline         On
+      Parser_Firstline  multiline_stdout
+      Read_From_Head    true
+
+    [FILTER]
+      Name                kubernetes
+      Match               kube.*
+      Kube_URL            https://kubernetes.default.svc:443
+      Kube_CA_File        /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+      Kube_Token_File     /var/run/secrets/kubernetes.io/serviceaccount/token
+      Kube_Tag_Prefix     kube.var.log.containers.
+      Merge_Log           On
+      Merge_Log_Key       log_processed
+      K8S-Logging.Parser  On
+      K8S-Logging.Exclude On
+      Labels              On
+      Annotations         Off
+      Use_Kubelet         False
+      Kubelet_Port        10250
+      Buffer_Size         0
+
+    [FILTER]
+      Name         grep
+      Match        kube.*
+      Exclude      $kubernetes['namespace_name'] kube-system
+      Exclude      $kubernetes['namespace_name'] logging
+      Exclude      $kubernetes['namespace_name'] default
+      Exclude      $kubernetes['namespace_name'] argo
+      Exclude      $kubernetes['namespace_name'] cert-manager
+      Exclude      $kubernetes['namespace_name'] kubecost
+      Exclude      $kubernetes['namespace_name'] opentelemetry-operator-system
+      Exclude      $kubernetes['namespace_name'] platform-observability
+      Exclude      $kubernetes['namespace_name'] istio-system
+      Exclude      $kubernetes['namespace_name'] amazon-cloudwatch
+      Exclude      log ^\s*$
+      Exclude      message ^\s*$
+
+    [FILTER]
+      Name    lua
+      Match   kube.*
+      script  /fluent-bit/etc/dynamic_index.lua
+      call    set_index
+
+    [OUTPUT]
+      Name es
+      Match kube.*
+      Host ${FLUENT_ELASTICSEARCH_HOST}
+      Port ${FLUENT_ELASTICSEARCH_PORT}
+      HTTP_User ${FLUENT_ELASTICSEARCH_USER}
+      HTTP_Passwd ${FLUENT_ELASTICSEARCH_PASSWD}
+      Retry_Limit False
+      Replace_Dots On
+      Suppress_Type_Name On
+      Logstash_Format On
+      Logstash_Prefix_Key es_index
+      Buffer_Size 5000k
+kind: ConfigMap
+metadata:
+  name: fluent-bit-config
+  namespace: logging
